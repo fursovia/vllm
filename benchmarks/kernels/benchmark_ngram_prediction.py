@@ -25,7 +25,12 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import NgramProposerGPU
 def benchmark(args):
     for length in args.lengths:
         config = VllmConfig(
-            model_config=ModelConfig(model="facebook/opt-125m", max_model_len=length),
+            model_config=ModelConfig(
+                model="facebook/opt-125m",
+                max_model_len=length,
+                # Only configure matcher buffers; no model weights are loaded.
+                hf_overrides={"max_position_embeddings": length},
+            ),
             scheduler_config=SchedulerConfig(
                 max_num_seqs=max(args.batches),
                 max_model_len=length,
