@@ -342,7 +342,13 @@ async def validate_lifecycle(session, args):
     ) as response:
         response.raise_for_status()
         async for raw in response.content:
-            if raw.startswith(b"data: ") and b'"content"' in raw:
+            if not raw.startswith(b"data: ") or raw.strip() == b"data: [DONE]":
+                continue
+            chunk = json.loads(raw[6:])
+            if any(
+                choice.get("delta", {}).get("content")
+                for choice in chunk.get("choices", [])
+            ):
                 break
     await asyncio.sleep(2)
     reused = await complete(
@@ -358,12 +364,38 @@ async def validate_lifecycle(session, args):
         },
     )
     assert reused["token_ids"] == baseline["token_ids"], (baseline, reused)
+    mixed = await asyncio.gather(
+        *(
+            complete(
+                session,
+                args,
+                {
+                    **base,
+                    "temperature": (0, 0.7, 1)[index % 3],
+                    "seed": index,
+                    **(
+                        {
+                            "prediction": {
+                                "type": "content",
+                                "content": prefix if index % 4 else baseline["text"],
+                            }
+                        }
+                        if index % 2 == 0
+                        else {}
+                    ),
+                },
+            )
+            for index in range(8)
+        )
+    )
+    assert all(record["usage"]["completion_tokens"] == 40 for record in mixed)
     return {
         "baseline": baseline,
         "exhausted": predicted,
         "limited": limited,
         "stopped": stopped,
         "reused": reused,
+        "mixed_temperatures": mixed,
     }
 
 
