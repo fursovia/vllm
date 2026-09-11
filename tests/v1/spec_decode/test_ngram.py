@@ -171,7 +171,9 @@ def test_prediction_compiled_proposer_mixed_batches(monkeypatch):
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
     config = VllmConfig(
         model_config=ModelConfig(model="facebook/opt-125m", max_model_len=32),
-        scheduler_config=SchedulerConfig(max_num_seqs=8, max_model_len=32),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=8, max_model_len=32, is_encoder_decoder=False
+        ),
         speculative_config=SpeculativeConfig(
             method="ngram_gpu",
             num_speculative_tokens=4,

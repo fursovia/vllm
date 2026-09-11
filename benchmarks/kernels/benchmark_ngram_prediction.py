@@ -29,6 +29,7 @@ def benchmark(args):
             scheduler_config=SchedulerConfig(
                 max_num_seqs=max(args.batches),
                 max_model_len=length,
+                is_encoder_decoder=False,
             ),
             speculative_config=SpeculativeConfig(
                 method="ngram_gpu",
