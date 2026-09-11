@@ -210,6 +210,11 @@ class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
     type: Literal["function"] = "function"
 
 
+class ChatCompletionPrediction(OpenAIBaseModel):
+    type: Literal["content"]
+    content: str
+
+
 class ChatCompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -226,6 +231,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     )
     max_completion_tokens: int | None = None
     n: int | None = 1
+    prediction: ChatCompletionPrediction | None = None
     presence_penalty: float | None = 0.0
     response_format: AnyResponseFormat | None = None
     seed: int | None = Field(None, ge=_INT64_MIN, le=_INT64_MAX)

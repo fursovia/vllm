@@ -469,6 +469,46 @@ def get_ratio_first_to_last(elements: list[float]) -> float:
     return elements[0] / elements[-1]
 
 
+@pytest.mark.parametrize("temperature", [0.7, 1.0])
+@pytest.mark.parametrize("top_k,top_p", [(0, 1.0), (3, 1.0), (0, 0.8), (3, 0.8)])
+@pytest.mark.parametrize("draft_token", [0, 2])
+def test_deterministic_drafts_preserve_target_distribution(
+    rejection_sampler,
+    temperature,
+    top_k,
+    top_p,
+    draft_token,
+):
+    """Delta-distribution drafts must preserve temperature and top-k/top-p sampling."""
+    torch.manual_seed(42)
+    samples = 50000
+    logits = torch.tensor([0.2, 0.6, 1.4, -0.3, 0.9], device=DEVICE_TYPE)
+    sorted_logits, order = (logits / temperature).sort(descending=True)
+    if top_k:
+        sorted_logits[top_k:] = -torch.inf
+    cumulative = sorted_logits.softmax(-1).cumsum(-1)
+    remove = cumulative - sorted_logits.softmax(-1) >= top_p
+    sorted_logits[remove] = -torch.inf
+    expected = torch.empty_like(logits)
+    expected[order] = sorted_logits.softmax(-1)
+
+    target_logits = logits.repeat(samples, 1)
+    metadata = create_spec_decode_metadata([[draft_token]] * samples, target_logits)
+    sampling = create_sampling_metadata(
+        all_greedy=False,
+        temperature=torch.full((samples,), temperature, device=DEVICE_TYPE),
+        top_k=torch.full((samples,), top_k or 5, dtype=torch.int32, device=DEVICE_TYPE),
+        top_p=torch.full((samples,), top_p, device=DEVICE_TYPE),
+    )
+    mock_sampler_output(
+        rejection_sampler,
+        torch.zeros((samples, 1), dtype=torch.long, device=DEVICE_TYPE),
+    )
+    output = rejection_sampler(metadata, None, target_logits, sampling)
+    counts = torch.bincount(output.sampled_token_ids[:, 0].long(), minlength=5)
+    torch.testing.assert_close(counts.float() / samples, expected, atol=0.012, rtol=0)
+
+
 def estimate_rejection_sampling_pdf(
     draft_probs: torch.Tensor,
     target_logits: torch.Tensor,

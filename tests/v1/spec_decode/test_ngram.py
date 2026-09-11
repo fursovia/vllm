@@ -1,16 +1,223 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import numpy as np
+import pytest
+import torch
 
 from vllm.config import (
     ModelConfig,
+    SchedulerConfig,
     SpeculativeConfig,
     VllmConfig,
+    set_current_vllm_config,
 )
+from vllm.sampling_params import SamplingParams
 from vllm.v1.spec_decode.ngram_proposer import (
     NgramProposer,
     _find_longest_matched_ngram_and_propose_tokens,
 )
+from vllm.v1.spec_decode.ngram_proposer_gpu import (
+    NgramPredictionGPUKernel,
+    NgramPredictionState,
+    NgramProposerGPU,
+)
+from vllm.v1.worker.gpu_input_batch import CachedRequestState
+
+
+@pytest.fixture
+def prediction_kernel():
+    config = VllmConfig(
+        model_config=ModelConfig(model="facebook/opt-125m", max_model_len=32),
+        speculative_config=SpeculativeConfig(
+            method="ngram_gpu",
+            num_speculative_tokens=4,
+            prompt_lookup_min=2,
+            prompt_lookup_max=4,
+        ),
+    )
+    with set_current_vllm_config(config):
+        return NgramPredictionGPUKernel(vllm_config=config)
+
+
+@pytest.mark.parametrize(
+    "output,corpus,expected",
+    [
+        ([], [1, 2, 3, 4], []),
+        ([1], [1, 2, 3, 4], []),
+        ([1, 2], [1, 2], []),
+        ([1, 2], [8, 9, 10], []),
+        ([1, 2], [1, 2, 3, 4, 5, 6, 7], [3, 4, 5, 6]),
+        ([1, 2, 3, 4], [1, 2, 3, 4, 5], [5]),
+        ([1, 2, 3, 4, 5], [1, 2, 3, 4, 5], []),
+        # Recompute after an insertion, deletion, or replacement.
+        ([1, 2, 99, 3, 4], [1, 2, 3, 4, 5, 6], [5, 6]),
+        ([1, 4, 5], [1, 2, 3, 4, 5, 6], [6]),
+        ([1, 99, 3, 4], [1, 2, 3, 4, 5, 6], [5, 6]),
+        # Prefer the longest match, then its earliest occurrence.
+        ([1, 2, 3], [2, 3, 8, 1, 2, 3, 9], [9]),
+        ([1, 2], [1, 2, 3, 1, 2, 4], [3, 1, 2, 4]),
+    ],
+)
+def test_prediction_matches_output_only(prediction_kernel, output, corpus, expected):
+    """Prompt tokens and corpus padding must not create prediction matches."""
+    prompt = [1, 2, 3, 4, 1]
+    tokens = torch.zeros((1, 32), dtype=torch.int32)
+    tokens[0, : len(prompt) + len(output)] = torch.tensor(prompt + output)
+    prediction = torch.zeros_like(tokens)
+    prediction[0, : len(corpus)] = torch.tensor(corpus)
+    drafts, counts = prediction_kernel.forward(
+        torch.tensor([len(prompt) + len(output)]),
+        tokens,
+        torch.tensor([True]),
+        prediction,
+        torch.tensor([len(corpus)]),
+        torch.tensor([len(prompt)]),
+        torch.tensor([32]),
+    )
+    assert drafts.tolist() == [expected + [-1] * (4 - len(expected))]
+    assert counts.tolist() == [len(expected)]
+
+
+def test_prediction_mixed_batch_masks_and_limits(prediction_kernel):
+    """Keep ordinary drafts and mask discarded or finished prediction requests."""
+    tokens = torch.zeros((5, 32), dtype=torch.int32)
+    tokens[:, :5] = torch.tensor([1, 2, 3, 1, 2])
+    prediction = torch.zeros_like(tokens)
+    prediction[:, :6] = torch.tensor([1, 2, 8, 9, 10, 11])
+    drafts, counts = prediction_kernel.forward(
+        torch.tensor([5] * 5),
+        tokens,
+        torch.tensor([True, True, False, True, True]),
+        prediction,
+        torch.tensor([6, 0, 6, 6, 6]),
+        torch.tensor([3] * 5),
+        torch.tensor([6, 32, 32, 5, 32]),
+    )
+    assert drafts.tolist() == [
+        [8, -1, -1, -1],
+        [3, 1, 2, -1],
+        [-1] * 4,
+        [-1] * 4,
+        [8, 9, 10, 11],
+    ]
+    assert counts.tolist() == [1, 3, 0, 0, 4]
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_prediction_state_batch_lifecycle(device):
+    """Swaps, preemption, cancellation, and reused IDs cannot leak another corpus."""
+
+    def request(req_id, tokens):
+        return CachedRequestState(
+            req_id=req_id,
+            prompt_token_ids=[50, 51, 52],
+            mm_features=[],
+            sampling_params=SamplingParams(prediction_token_ids=tokens, max_tokens=7),
+            generator=None,
+            block_ids=([],),
+            num_computed_tokens=0,
+            output_token_ids=[],
+        )
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    state = NgramPredictionState(3, 32, torch.device(device))
+    requests = {"a": request("a", [1, 2, 3]), "b": request("b", [8, 9])}
+    state.update({"a": 0, "b": 1}, requests)
+    state.update({"a": 1, "b": 0}, requests)
+    assert state.token_ids[0, :2].tolist() == [8, 9]
+    assert state.token_ids[1, :3].tolist() == [1, 2, 3]
+    assert state.lengths.tolist() == [2, 3, 0]
+    assert state.prompt_lengths.tolist() == [3, 3, 0]
+    assert state.token_limits.tolist() == [10, 10, 0]
+    state.update({"a": 0}, requests)
+    assert state.lengths.tolist() == [3, 0, 0]
+    state.update({"a": 0, "b": 1}, requests)
+    assert state.token_ids[1, :2].tolist() == [8, 9]
+    requests["a"] = request("a", [6])
+    state.update({"a": 0, "b": 1}, requests)
+    assert state.token_ids[0, 0].item() == 6
+    assert state.lengths.tolist() == [1, 2, 0]
+    requests["a"] = request("a", None)
+    state.update({"a": 0}, requests)
+    assert state.lengths.tolist() == [0, 0, 0]
+    assert not state.req_indices
+
+
+def test_prediction_default_match_requires_five_output_tokens(prediction_kernel):
+    prediction_kernel.min_n = prediction_kernel.max_n = 5
+    tokens = torch.tensor([[90, 1, 2, 3, 4, 5, 0, 0]], dtype=torch.int32)
+    corpus = torch.tensor([[1, 2, 3, 4, 5, 6, 0, 0]], dtype=torch.int32)
+    for output_len, corpus_len, expected in (
+        (4, 6, [-1] * 4),
+        (5, 5, [-1] * 4),
+        (5, 6, [6, -1, -1, -1]),
+    ):
+        drafts, _ = prediction_kernel.forward(
+            torch.tensor([1 + output_len]),
+            tokens,
+            torch.tensor([True]),
+            corpus,
+            torch.tensor([corpus_len]),
+            torch.tensor([1]),
+            torch.tensor([8]),
+        )
+        assert drafts.tolist() == [expected]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_prediction_compiled_proposer_mixed_batches(monkeypatch):
+    """Exercise warmup, dynamic batches, and accepted-token writes on the GPU."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    config = VllmConfig(
+        model_config=ModelConfig(model="facebook/opt-125m", max_model_len=32),
+        scheduler_config=SchedulerConfig(max_num_seqs=8, max_model_len=32),
+        speculative_config=SpeculativeConfig(
+            method="ngram_gpu",
+            num_speculative_tokens=4,
+            prompt_lookup_min=2,
+            prompt_lookup_max=4,
+        ),
+    )
+    device = torch.device("cuda:0")
+    with set_current_vllm_config(config):
+        proposer = NgramProposerGPU(config, device)
+    request = CachedRequestState(
+        req_id="prediction",
+        prompt_token_ids=[50, 51, 52],
+        mm_features=[],
+        sampling_params=SamplingParams(
+            prediction_token_ids=[1, 2, 8, 9], max_tokens=20
+        ),
+        generator=None,
+        block_ids=([],),
+        num_computed_tokens=3,
+        output_token_ids=[1],
+    )
+    for batch_size in (1, 8, 2, 1):
+        tokens = torch.zeros((batch_size, 32), dtype=torch.int32, device=device)
+        tokens[:, :4] = torch.tensor([1, 2, 3, 1], device=device)
+        tokens[0, :4] = torch.tensor([50, 51, 52, 1], device=device)
+        proposer.prediction_state.update({"prediction": 0}, {"prediction": request})
+        lengths = torch.full((batch_size,), 4, dtype=torch.int32, device=device)
+        sampled = torch.full((batch_size, 5), -1, dtype=torch.int32, device=device)
+        sampled[:, 0] = 2
+        drafts, counts = proposer.propose(
+            4,
+            lengths,
+            tokens,
+            sampled,
+            torch.ones_like(lengths),
+        )
+        assert drafts[0].tolist() == [8, 9, -1, -1]
+        assert counts[0].item() == 2
+        if batch_size > 1:
+            assert drafts[1:].tolist() == [[3, 1, 2, -1]] * (batch_size - 1)
+        assert lengths.tolist() == [4] * batch_size
+        assert tokens[:, 4].tolist() == [2] * batch_size
+    proposer.prediction_state.update({}, {})
+    drafts, _ = proposer.propose(4, lengths, tokens, sampled, torch.ones_like(lengths))
+    assert drafts.tolist() == [[-1, -1, -1, -1]]
 
 
 def test_find_longest_matched_ngram_and_propose_tokens():

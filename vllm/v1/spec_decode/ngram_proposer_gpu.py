@@ -16,8 +16,10 @@ from vllm.config import (
     CompilationMode,
     CUDAGraphMode,
     VllmConfig,
+    set_current_vllm_config,
 )
 from vllm.forward_context import set_forward_context
+from vllm.sampling_params import MAX_PREDICTION_TOKENS
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.utils import record_function_or_nullcontext
@@ -44,13 +46,16 @@ class NgramGPUKernel(nn.Module):
         self.max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         self.device = device
 
+    @staticmethod
     def _find_first_and_extract_all_n_parallel(
-        self,
         token_ids: torch.Tensor,
         seq_lengths: torch.Tensor,
         min_ngram_len: int,
         max_ngram_len: int,
         num_draft_tokens: int,
+        corpus_token_ids: torch.Tensor | None = None,
+        corpus_lengths: torch.Tensor | None = None,
+        suffix_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Find suffix n-gram matches and extract following tokens.
@@ -63,12 +68,21 @@ class NgramGPUKernel(nn.Module):
             min_ngram_len: Minimum n-gram size to search for (e.g., 2)
             max_ngram_len: Maximum n-gram size to search for (e.g., 5)
             num_draft_tokens: Number of tokens to extract after match (k)
+            corpus_token_ids: Optional corpus separate from the sequence.
+            corpus_lengths: Valid corpus lengths, excluding padding.
+            suffix_lengths: Number of sequence tokens eligible for suffix matching.
 
         Returns:
             Draft token predictions; -1 means invalid/no match.
         """
         batch_size = token_ids.shape[0]
-        max_seq_len = token_ids.shape[1]
+        if corpus_token_ids is None:
+            corpus_token_ids = token_ids
+        if corpus_lengths is None:
+            corpus_lengths = seq_lengths
+        if suffix_lengths is None:
+            suffix_lengths = seq_lengths
+        max_seq_len = corpus_token_ids.shape[1]
         device = token_ids.device
         num_ngram_sizes = max_ngram_len - min_ngram_len + 1
 
@@ -82,8 +96,10 @@ class NgramGPUKernel(nn.Module):
         )
 
         for i, ngram_len in enumerate(range(min_ngram_len, max_ngram_len + 1)):
+            if ngram_len > max_seq_len:
+                continue
             # Sliding windows of size ngram_len; unfold is O(1) view.
-            search_windows = token_ids.unfold(1, ngram_len, 1)
+            search_windows = corpus_token_ids.unfold(1, ngram_len, 1)
             num_windows = search_windows.shape[1]
 
             # Trailing suffix (last ngram_len tokens) for each sequence.
@@ -91,17 +107,19 @@ class NgramGPUKernel(nn.Module):
             suffix_indices = suffix_starts.unsqueeze(1) + torch.arange(
                 ngram_len, device=device
             )
-            suffix_indices.clamp_(min=0)
+            suffix_indices.clamp_(min=0, max=token_ids.shape[1] - 1)
             suffix = torch.gather(token_ids, 1, suffix_indices)
 
             # Window matches for each sequence.
             matches = (search_windows == suffix.unsqueeze(1)).all(dim=-1)
 
             # Match must leave room for at least one draft token.
-            max_valid_suffix_start = seq_lengths - ngram_len - 1
+            max_valid_suffix_start = corpus_lengths - ngram_len - 1
             window_positions = torch.arange(num_windows, device=device)
             valid_mask = window_positions <= max_valid_suffix_start.unsqueeze(1)
-            final_matches = matches & valid_mask
+            final_matches = (
+                matches & valid_mask & (suffix_lengths >= ngram_len).unsqueeze(1)
+            )
 
             # Find earliest match (argmax=0 when empty; verify with has_match).
             first_match_idx = torch.argmax(final_matches.int(), dim=1)
@@ -129,7 +147,7 @@ class NgramGPUKernel(nn.Module):
             best_match_pos + best_ngram_lengths,
             torch.zeros_like(best_match_pos),
         )
-        tokens_available = seq_lengths - draft_start
+        tokens_available = corpus_lengths - draft_start
 
         # Gather indices for draft tokens.
         draft_indices = draft_start.unsqueeze(1) + torch.arange(
@@ -138,7 +156,7 @@ class NgramGPUKernel(nn.Module):
         draft_indices.clamp_(min=0, max=max_seq_len - 1)
 
         # Extract draft tokens; gather always runs.
-        draft_tokens = torch.gather(token_ids, 1, draft_indices)
+        draft_tokens = torch.gather(corpus_token_ids, 1, draft_indices)
 
         # Mask positions beyond available tokens.
         position_indices = torch.arange(num_draft_tokens, device=device).unsqueeze(0)
@@ -214,6 +232,136 @@ class NgramGPUKernel(nn.Module):
         pass
 
 
+@support_torch_compile()
+class NgramPredictionGPUKernel(nn.Module):
+    """Match output suffixes against prediction corpora in a mixed batch."""
+
+    def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        spec = vllm_config.speculative_config
+        assert spec is not None
+        assert spec.prompt_lookup_min is not None
+        assert spec.prompt_lookup_max is not None
+        self.min_n = spec.prompt_lookup_min
+        self.max_n = spec.prompt_lookup_max
+        self.k = spec.num_speculative_tokens
+
+    def forward(
+        self,
+        seq_lengths: torch.Tensor,
+        token_ids: torch.Tensor,
+        combined_mask: torch.Tensor,
+        prediction_token_ids: torch.Tensor,
+        prediction_lengths: torch.Tensor,
+        prompt_lengths: torch.Tensor,
+        token_limits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        match = NgramGPUKernel._find_first_and_extract_all_n_parallel
+        ordinary = match(token_ids, seq_lengths, self.min_n, self.max_n, self.k)
+        predicted = match(
+            token_ids,
+            seq_lengths,
+            self.min_n,
+            self.max_n,
+            self.k,
+            corpus_token_ids=prediction_token_ids,
+            corpus_lengths=prediction_lengths,
+            suffix_lengths=seq_lengths - prompt_lengths,
+        )
+        positions = torch.arange(self.k, device=token_ids.device)
+        predicted = torch.where(
+            positions.unsqueeze(0) < (token_limits - seq_lengths).unsqueeze(1),
+            predicted,
+            -1,
+        )
+        drafts = torch.where((prediction_lengths > 0).unsqueeze(1), predicted, ordinary)
+        drafts = torch.where(combined_mask.unsqueeze(1), drafts, -1)
+        return drafts, (drafts != -1).sum(dim=1, dtype=torch.int32)
+
+
+class NgramPredictionState:
+    """Immutable corpora aligned with the current persistent input batch."""
+
+    def __init__(self, max_num_seqs: int, max_model_len: int, device: torch.device):
+        self.device = device
+        self.max_model_len = max_model_len
+        self.token_ids = torch.zeros(
+            (max_num_seqs, min(MAX_PREDICTION_TOKENS, max_model_len)),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.lengths = torch.zeros(max_num_seqs, dtype=torch.int32, device=device)
+        self.prompt_lengths = torch.zeros_like(self.lengths)
+        self.token_limits = torch.zeros_like(self.lengths)
+        self.req_indices: dict[str, int] = {}
+        self.requests: dict[str, CachedRequestState] = {}
+
+    def update(
+        self, req_id_to_index: dict[str, int], requests: dict[str, CachedRequestState]
+    ) -> None:
+        indices = {
+            req_id: idx
+            for req_id, idx in req_id_to_index.items()
+            if (params := requests[req_id].sampling_params) is not None
+            and params.prediction_token_ids
+        }
+        replaced = {
+            req_id
+            for req_id in indices
+            if requests[req_id] is not self.requests.get(req_id)
+        }
+        if indices == self.req_indices and not replaced:
+            return
+
+        moved = [
+            req_id
+            for req_id, idx in indices.items()
+            if req_id not in replaced and self.req_indices[req_id] != idx
+        ]
+        if moved:
+            src = async_tensor_h2d(
+                [self.req_indices[req_id] for req_id in moved],
+                dtype=torch.long,
+                device=self.device,
+            )
+            dst = async_tensor_h2d(
+                [indices[req_id] for req_id in moved],
+                dtype=torch.long,
+                device=self.device,
+            )
+            # Gather before writing: moves may overlap or swap two rows.
+            self.token_ids[dst] = self.token_ids[src]
+
+        lengths = [0] * self.lengths.shape[0]
+        prompt_lengths = [0] * len(lengths)
+        token_limits = [0] * len(lengths)
+        for req_id, idx in indices.items():
+            request = requests[req_id]
+            params = request.sampling_params
+            assert params is not None and params.prediction_token_ids
+            tokens = params.prediction_token_ids
+            lengths[idx] = len(tokens)
+            prompt_lengths[idx] = request.num_prompt_tokens
+            token_limits[idx] = min(
+                self.max_model_len,
+                request.num_prompt_tokens + (params.max_tokens or self.max_model_len),
+            )
+            if req_id in replaced:
+                self.token_ids[idx, : len(tokens)].copy_(
+                    async_tensor_h2d(tokens, dtype=torch.int32, device=self.device)
+                )
+        for buffer, values in (
+            (self.lengths, lengths),
+            (self.prompt_lengths, prompt_lengths),
+            (self.token_limits, token_limits),
+        ):
+            buffer.copy_(
+                async_tensor_h2d(values, dtype=torch.int32, device=self.device)
+            )
+        self.req_indices = indices
+        self.requests = {req_id: requests[req_id] for req_id in indices}
+
+
 class NgramProposerGPU:
     def __init__(self, vllm_config: VllmConfig, device: torch.device, runner=None):
         assert vllm_config.speculative_config is not None
@@ -259,6 +407,18 @@ class NgramProposerGPU:
         self.kernel.to(device)
         self.kernel.eval()
 
+        self.prediction_state = NgramPredictionState(
+            self.max_num_seqs, self.max_model_len, device
+        )
+        with set_current_vllm_config(self.vllm_config):
+            self.prediction_kernel = (
+                NgramPredictionGPUKernel(
+                    vllm_config=self.vllm_config, prefix="ngram_prediction_gpu_kernel"
+                )
+                .to(device)
+                .eval()
+            )
+
         self._dummy_run()
 
     def _dummy_run(self):
@@ -274,6 +434,16 @@ class NgramProposerGPU:
         for _ in range(3):
             with set_forward_context(None, self.vllm_config):
                 _, _ = self.kernel(num_tokens, token_ids, combined_mask)
+                state = self.prediction_state
+                _, _ = self.prediction_kernel(
+                    num_tokens,
+                    token_ids,
+                    combined_mask,
+                    state.token_ids,
+                    state.lengths,
+                    state.prompt_lengths,
+                    state.token_limits,
+                )
 
     def _generate_dummy_data(
         self,
@@ -382,11 +552,21 @@ class NgramProposerGPU:
             combined_mask = sampled_flags & valid_mask & (num_tokens_tmp >= self.min_n)
 
             with record_function_or_nullcontext("ngram_proposer_gpu: kernel"):
-                draft_tokens, num_valid_draft_tokens = self.kernel(
-                    num_tokens_tmp,
-                    token_ids_gpu,
-                    combined_mask,
-                )
+                state = self.prediction_state
+                if state.req_indices:
+                    draft_tokens, num_valid_draft_tokens = self.prediction_kernel(
+                        num_tokens_tmp,
+                        token_ids_gpu,
+                        combined_mask,
+                        state.token_ids[:batch_size],
+                        state.lengths[:batch_size],
+                        state.prompt_lengths[:batch_size],
+                        state.token_limits[:batch_size],
+                    )
+                else:
+                    draft_tokens, num_valid_draft_tokens = self.kernel(
+                        num_tokens_tmp, token_ids_gpu, combined_mask
+                    )
 
             return draft_tokens, num_valid_draft_tokens
 

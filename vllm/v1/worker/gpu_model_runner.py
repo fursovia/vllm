@@ -1550,6 +1550,10 @@ class GPUModelRunner(
                 _pinned_idx_buf=self._ngram_pinned_idx_buf,
                 _pinned_val_buf=self._ngram_pinned_val_buf,
             )
+            assert isinstance(self.drafter, NgramProposerGPU)
+            self.drafter.prediction_state.update(
+                self.input_batch.req_id_to_index, self.requests
+            )
 
         if deferred_spec_decode_corrections:
 

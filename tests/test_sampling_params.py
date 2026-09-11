@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
+from types import SimpleNamespace
 
+import msgspec
 import pytest
 
 from vllm import SamplingParams
@@ -13,9 +15,37 @@ class MockModelConfig:
     is_diffusion: bool = False
     max_logprobs: int = 20
     logits_processors: list | None = None
+    max_model_len: int = 32
 
     def get_vocab_size(self) -> int:
         return 1024
+
+
+def test_prediction_tokens_survive_request_transport():
+    params = SamplingParams(prediction_token_ids=[0, 1, 1023], temperature=0.7)
+    decoded = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(params), type=SamplingParams
+    )
+    decoded.verify(
+        MockModelConfig(),
+        SimpleNamespace(use_ngram_gpu=lambda: True),
+        None,
+        None,
+    )
+    assert decoded.prediction_token_ids == [0, 1, 1023]
+    assert decoded.clone().prediction_token_ids == decoded.prediction_token_ids
+    assert decoded.clone().prediction_token_ids is not decoded.prediction_token_ids
+
+
+@pytest.mark.parametrize("tokens", [[-1], [1024], [True], [1.5], list(range(33))])
+def test_prediction_rejects_invalid_token_corpus(tokens):
+    with pytest.raises(VLLMValidationError, match="prediction_token_ids"):
+        SamplingParams(prediction_token_ids=tokens).verify(
+            MockModelConfig(),
+            SimpleNamespace(use_ngram_gpu=lambda: True),
+            None,
+            None,
+        )
 
 
 @pytest.mark.parametrize(

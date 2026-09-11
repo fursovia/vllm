@@ -100,6 +100,10 @@ class InputProcessor:
                 self.structured_outputs_config,
                 self.tokenizer,
             )
+            if params.prediction_token_ids and self.vllm_config.use_v2_model_runner:
+                raise VLLMValidationError(
+                    "prediction_token_ids requires VLLM_USE_V2_MODEL_RUNNER=0."
+                )
 
             if self.model_config.return_sampling_mask:
                 if params.temperature <= 0:

@@ -25,3 +25,58 @@ for output in outputs:
     generated_text = output.outputs[0].text
     print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
 ```
+
+## Predicted text with `ngram_gpu`
+
+Chat Completions accepts a separate prediction corpus when using the V1 model
+runner with `ngram_gpu`. This can accelerate document and code editing when most
+of the requested output already exists. Include the original document and editing
+instructions in `messages`; `prediction` is a drafting hint, not prompt content.
+
+```bash
+VLLM_USE_V2_MODEL_RUNNER=0 vllm serve google/gemma-4-E2B-it \
+  --tensor-parallel-size 1 --pipeline-parallel-size 1 --data-parallel-size 1 \
+  --async-scheduling \
+  --default-chat-template-kwargs '{"enable_thinking": false}' \
+  --speculative-config '{"method":"ngram_gpu","num_speculative_tokens":8}'
+```
+
+```python
+from openai import OpenAI
+
+original = "# Release checklist\n\nDeploy to staging before production.\n"
+response = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY").chat.completions.create(
+    model="google/gemma-4-E2B-it",
+    messages=[{
+        "role": "user",
+        "content": "Replace staging with development. Return the full document.\n\n" + original,
+    }],
+    prediction={"type": "content", "content": original},
+    temperature=0,
+)
+print(response.choices[0].message.content)
+```
+
+Supported scope:
+
+- String prediction content, text-only messages, and `n=1`. Streaming, greedy
+  decoding, and nonzero-temperature sampling are supported. Beam search, tools,
+  multimodal inputs, and structured outputs are not supported with a prediction.
+- Predictions are tokenized once without special tokens or whitespace stripping.
+  The limit is 16,384 tokens or the model context length, whichever is smaller.
+  Missing and empty predictions preserve ordinary request behavior.
+- Matching uses only generated output. The default minimum match is five tokens,
+  so predictions of five tokens or fewer cannot accelerate generation. The matcher
+  chooses the longest matching suffix, breaking ties by earliest corpus position,
+  and can resume drafting after an edit once another suffix matches.
+- `num_speculative_tokens` caps each draft, not the prediction length. Prediction
+  exhaustion does not stop generation. The target model verifies all drafts using
+  the existing rejection sampler, including temperature and top-k/top-p filters.
+  Stochastic text need not match a nonspeculative run with the same seed.
+
+Use the existing [acceptance metrics](acceptance_metrics.md) to inspect drafting.
+Resident prediction buffers add approximately
+`4 * max_num_seqs * (min(max_model_len, 16384) + 3)` bytes on each drafting worker.
+Benchmark with `benchmarks/benchmark_prediction.py`, comparing V2 without
+speculation, V1 without speculation, ordinary V1 `ngram_gpu`, and requests with
+predictions. Compare temperatures separately: lower acceptance can reduce speedup.

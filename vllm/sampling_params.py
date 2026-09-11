@@ -27,6 +27,9 @@ logger = init_logger(__name__)
 _SAMPLING_EPS = 1e-5
 _MAX_TEMP = 1e-2
 
+MAX_PREDICTION_TOKENS = 16384
+"""Maximum prediction corpus length; also bounded by the model context length."""
+
 MAX_LOGPROB_TOKEN_IDS = 128
 """Upper bound on `SamplingParams.logprob_token_ids` list length. Must match
 the per-request row width allocated by the sampler's `LogprobTokenIdsState`."""
@@ -348,6 +351,8 @@ class SamplingParams(
     """Arbitrary additional args, that can be used by custom sampling
     implementations, plugins, etc. Not used by any in-tree sampling
     implementations."""
+    prediction_token_ids: list[int] | None = None
+    """Immutable prediction corpus for V1 ngram_gpu speculative decoding."""
     # Fields used for bad words
     bad_words: list[str] | None = None
     """Words that are not allowed to be generated. More precisely, only the
@@ -830,10 +835,36 @@ class SamplingParams(
         self._validate_logits_processors(model_config)
         self._validate_allowed_token_ids(model_config)
         self._validate_spec_decode(speculative_config)
+        self._validate_prediction(model_config, speculative_config)
         self._validate_diffusion(model_config)
         self._validate_structured_outputs(
             model_config, structured_outputs_config, tokenizer
         )
+
+    def _validate_prediction(
+        self, model_config: ModelConfig, speculative_config: SpeculativeConfig | None
+    ) -> None:
+        if not self.prediction_token_ids:
+            return
+        if speculative_config is None or not speculative_config.use_ngram_gpu():
+            raise VLLMValidationError("prediction_token_ids requires ngram_gpu.")
+        if self.n != 1 or self.structured_outputs is not None:
+            raise VLLMValidationError(
+                "prediction_token_ids requires n=1 without structured outputs."
+            )
+        limit = min(MAX_PREDICTION_TOKENS, model_config.max_model_len)
+        if len(self.prediction_token_ids) > limit:
+            raise VLLMValidationError(
+                f"prediction_token_ids must contain at most {limit} tokens."
+            )
+        vocab_size = model_config.get_vocab_size()
+        if any(
+            type(token) is not int or not 0 <= token < vocab_size
+            for token in self.prediction_token_ids
+        ):
+            raise VLLMValidationError(
+                "prediction_token_ids must contain valid integer vocabulary IDs."
+            )
 
     def _validate_logprobs(self, model_config: ModelConfig) -> None:
         max_logprobs = model_config.max_logprobs

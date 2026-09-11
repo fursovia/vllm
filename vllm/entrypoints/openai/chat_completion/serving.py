@@ -62,8 +62,9 @@ from vllm.outputs import RequestOutput
 from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
 from vllm.renderers.online_renderer import OnlineRenderer
-from vllm.sampling_params import BeamSearchParams, SamplingParams
+from vllm.sampling_params import MAX_PREDICTION_TOKENS, BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
+from vllm.utils.async_utils import make_async
 from vllm.utils.collection_utils import as_list
 from vllm.utils.serial_utils import numpy2base64
 
@@ -263,6 +264,10 @@ class OpenAIServingChat(GenerateBaseServing):
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
+        try:
+            prediction_token_ids = await self._prepare_prediction(request)
+        except ValueError as exc:
+            return self.create_error_response(str(exc), param="prediction")
         chat_template_kwargs = self._effective_chat_template_kwargs(request)
         parser: Parser | None = None
         if self.parser_cls is not None:
@@ -328,6 +333,7 @@ class OpenAIServingChat(GenerateBaseServing):
                     max_tokens,
                     self.default_sampling_params,
                 )
+                sampling_params.prediction_token_ids = prediction_token_ids
 
             self._log_inputs(
                 sub_request_id,
@@ -413,6 +419,57 @@ class OpenAIServingChat(GenerateBaseServing):
             parser=parser,
             mm_token_counts=mm_token_counts,
         )
+
+    async def _prepare_prediction(
+        self, request: ChatCompletionRequest
+    ) -> list[int] | None:
+        prediction = request.prediction
+        if prediction is None or not prediction.content:
+            return None
+
+        config = self.engine_client.vllm_config
+        if (
+            config.use_v2_model_runner
+            or config.speculative_config is None
+            or not config.speculative_config.use_ngram_gpu()
+        ):
+            raise ValueError(
+                "prediction requires VLLM_USE_V2_MODEL_RUNNER=0 and "
+                "speculative decoding with method='ngram_gpu'."
+            )
+        if request.use_beam_search or (request.n or 1) != 1:
+            raise ValueError("prediction requires n=1 and use_beam_search=False.")
+        if request.tools or request.tool_choice not in (None, "none"):
+            raise ValueError("prediction does not support tools.")
+        if request.structured_outputs is not None or (
+            request.response_format is not None
+            and request.response_format.type != "text"
+        ):
+            raise ValueError("prediction does not support structured outputs.")
+        for message in request.messages:
+            content = message.get("content")
+            if (
+                message["role"] in ("tool", "function")
+                or message.get("tool_calls")
+                or message.get("function_call")
+                or (
+                    isinstance(content, list)
+                    and any(part.get("type") != "text" for part in content)
+                )
+            ):
+                raise ValueError(
+                    "prediction supports text-only messages without tools."
+                )
+
+        tokenizer = self.renderer.tokenizer
+        assert tokenizer is not None
+        token_ids = await make_async(tokenizer.encode)(
+            prediction.content, add_special_tokens=False
+        )
+        limit = min(MAX_PREDICTION_TOKENS, self.model_config.max_model_len)
+        if len(token_ids) > limit:
+            raise ValueError(f"prediction must contain at most {limit} tokens.")
+        return token_ids or None
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
         if request.add_generation_prompt:

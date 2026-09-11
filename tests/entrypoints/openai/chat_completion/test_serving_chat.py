@@ -5,12 +5,14 @@ import json
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
 from openai import OpenAI
+from pydantic import ValidationError
 
 from tests.entrypoints.openai.utils import (
     accumulate_streaming_response,
@@ -676,6 +678,176 @@ async def _stream_request_outputs(
 ) -> AsyncIterator[RequestOutput]:
     for request_output in request_outputs:
         yield request_output
+
+
+@pytest.fixture
+def prediction_serving_chat():
+    engine = MagicMock(spec=AsyncLLM)
+    engine.errored = False
+    engine.model_config = MockModelConfig()
+    engine.input_processor = MagicMock()
+    engine.renderer = _build_renderer(engine.model_config)
+    engine.vllm_config = SimpleNamespace(
+        use_v2_model_runner=False,
+        speculative_config=SimpleNamespace(use_ngram_gpu=lambda: True),
+    )
+    engine.generate.return_value = _single_request_output(
+        _make_metrics_request_output()
+    )
+    return _build_serving_chat(engine)
+
+
+@pytest.mark.parametrize(
+    "prediction",
+    [
+        {"type": "other", "content": "text"},
+        {"type": "content", "content": [{"type": "text", "text": "text"}]},
+        {"type": "content", "content": 123},
+        {"content": "text"},
+    ],
+)
+def test_prediction_rejects_unsupported_content(prediction):
+    with pytest.raises(ValidationError):
+        ChatCompletionRequest(messages=[], prediction=prediction)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("temperature", [0.0, 0.7, 1.0])
+async def test_prediction_transport_preserves_text(
+    prediction_serving_chat,
+    monkeypatch,
+    stream,
+    temperature,
+):
+    """Tokenize the untouched prediction once, independently of messages."""
+    serving = prediction_serving_chat
+    tokenizer = serving.renderer.tokenizer
+    text = "  first line\n\nlast line  "
+    expected = tokenizer.encode(text, add_special_tokens=False)
+    encode = MagicMock(wraps=tokenizer.encode)
+    monkeypatch.setattr(tokenizer, "encode", encode)
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "Edit this text."}],
+        prediction={"type": "content", "content": text},
+        temperature=temperature,
+        stream=stream,
+    )
+    response = await serving.create_chat_completion(request)
+    assert not isinstance(response, ErrorResponse)
+    if stream:
+        chunks = [chunk async for chunk in response]
+        assert chunks[-1] == "data: [DONE]\n\n"
+    else:
+        assert response.choices[0].message.content == "Hello"
+    params = serving.engine_client.generate.call_args.args[1]
+    assert params.prediction_token_ids == expected
+    assert params.temperature == temperature
+    prediction_calls = [call for call in encode.call_args_list if call.args[0] == text]
+    assert len(prediction_calls) == 1
+    assert prediction_calls[0].kwargs == {"add_special_tokens": False}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changes,error",
+    [
+        ({"use_beam_search": True}, "use_beam_search=False"),
+        ({"n": 2}, "n=1"),
+        ({"response_format": {"type": "json_object"}}, "structured outputs"),
+        ({"structured_outputs": {"choice": ["a", "b"]}}, "structured outputs"),
+        ({"tools": [{"type": "function", "function": {"name": "test"}}]}, "tools"),
+        (
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "https://example.com/image.png"},
+                            },
+                        ],
+                    }
+                ]
+            },
+            "text-only",
+        ),
+    ],
+)
+async def test_prediction_rejects_unsupported_requests(
+    prediction_serving_chat,
+    changes,
+    error,
+):
+    request = ChatCompletionRequest(
+        **{
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "hello"}],
+            "prediction": {"type": "content", "content": "predicted text"},
+            **changes,
+        }
+    )
+    response = await prediction_serving_chat.create_chat_completion(request)
+    assert isinstance(response, ErrorResponse)
+    assert error in response.error.message
+    prediction_serving_chat.engine_client.generate.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "runner_v2,method", [(True, "ngram_gpu"), (False, None), (False, "ngram")]
+)
+@pytest.mark.parametrize("content", [None, "", "prediction"])
+async def test_prediction_requires_supported_server_only_when_nonempty(
+    prediction_serving_chat,
+    runner_v2,
+    method,
+    content,
+):
+    serving = prediction_serving_chat
+    serving.engine_client.vllm_config = SimpleNamespace(
+        use_v2_model_runner=runner_v2,
+        speculative_config=(
+            SimpleNamespace(use_ngram_gpu=lambda: method == "ngram_gpu")
+            if method
+            else None
+        ),
+    )
+    response = await serving.create_chat_completion(
+        ChatCompletionRequest(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": "hello"}],
+            prediction={"type": "content", "content": content}
+            if content is not None
+            else None,
+        )
+    )
+    if content:
+        assert isinstance(response, ErrorResponse)
+        assert "VLLM_USE_V2_MODEL_RUNNER=0" in response.error.message
+        serving.engine_client.generate.assert_not_called()
+    else:
+        assert not isinstance(response, ErrorResponse)
+        assert (
+            serving.engine_client.generate.call_args.args[1].prediction_token_ids
+            is None
+        )
+
+
+@pytest.mark.asyncio
+async def test_prediction_rejects_overlong_corpus(prediction_serving_chat):
+    response = await prediction_serving_chat.create_chat_completion(
+        ChatCompletionRequest(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": "hello"}],
+            prediction={"type": "content", "content": " token" * 101},
+        )
+    )
+    assert isinstance(response, ErrorResponse)
+    assert "at most 100 tokens" in response.error.message
+    prediction_serving_chat.engine_client.generate.assert_not_called()
 
 
 async def _collect_metrics_stream_chunks(
