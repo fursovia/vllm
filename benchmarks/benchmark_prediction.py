@@ -105,6 +105,7 @@ async def metrics(session, base_url):
     names = (
         "vllm:spec_decode_num_draft_tokens_total",
         "vllm:spec_decode_num_accepted_tokens_total",
+        "vllm:num_preemptions_total",
     )
     result = dict.fromkeys(names, 0.0)
     for family in text_string_to_metric_families(body):
@@ -399,6 +400,37 @@ async def validate_lifecycle(session, args):
     }
 
 
+async def validate_preemption(session, args):
+    """Compare mixed requests after forced preemption with sequential references.
+
+    Run against a server with a small --num-gpu-blocks-override. The caller checks
+    that preemption actually occurred, so an unconstrained run cannot pass.
+    """
+    ordinary_args = argparse.Namespace(**{**vars(args), "prediction": False})
+    prediction_args = argparse.Namespace(**{**vars(args), "prediction": True})
+    references = [
+        await request(session, ordinary_args, index, "mixed", 0) for index in range(8)
+    ]
+    await asyncio.sleep(2)
+    before = await metrics(session, args.base_url)
+    records = await asyncio.gather(
+        *(request(session, prediction_args, index, "mixed", 0) for index in range(8))
+    )
+    await asyncio.sleep(2)
+    after = await metrics(session, args.base_url)
+    return {
+        "preemptions": after["vllm:num_preemptions_total"]
+        - before["vllm:num_preemptions_total"],
+        "matching_token_ids": [
+            bool(reference["token_ids"])
+            and reference["token_ids"] == record["token_ids"]
+            for reference, record in zip(references, records)
+        ],
+        "references": references,
+        "records": records,
+    }
+
+
 async def run(args):
     output = {
         "args": vars(args),
@@ -411,6 +443,14 @@ async def run(args):
     async with aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=300)
     ) as session:
+        if args.validate_preemption:
+            result = await validate_preemption(session, args)
+            output["preemption"] = result
+            Path(args.output).write_text(json.dumps(output, indent=2) + "\n")
+            assert result["preemptions"] > 0, "No preemption occurred"
+            assert all(result["matching_token_ids"]), result["matching_token_ids"]
+            print("Forced-preemption checks passed", flush=True)
+            return
         if args.validate_lifecycle:
             output["lifecycle"] = await validate_lifecycle(session, args)
             Path(args.output).write_text(json.dumps(output, indent=2) + "\n")
@@ -487,6 +527,7 @@ if __name__ == "__main__":
     parser.add_argument("--requests", type=int, default=24)
     parser.add_argument("--eval-questions", type=int, default=0)
     parser.add_argument("--validate-lifecycle", action="store_true")
+    parser.add_argument("--validate-preemption", action="store_true")
     parser.add_argument("--max-tokens", type=int, default=1536)
     parser.add_argument("--concurrencies", type=int, nargs="+", default=[1, 8])
     parser.add_argument("--temperatures", type=float, nargs="+", default=[0, 0.7, 1])
