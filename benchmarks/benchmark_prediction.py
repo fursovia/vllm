@@ -276,6 +276,97 @@ async def evaluate(session, args):
     return runs
 
 
+async def validate_lifecycle(session, args):
+    """Check stopping, prediction exhaustion, cancellation, and request-ID reuse."""
+    base = {
+        "model": args.model,
+        "temperature": 0,
+        "max_completion_tokens": 40,
+        "ignore_eos": True,
+        "return_token_ids": True,
+        "stream": False,
+        "chat_template_kwargs": {"enable_thinking": False},
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "Write one through fifty in English, separated by spaces. "
+                    "Do not include any other text."
+                ),
+            }
+        ],
+    }
+    baseline = await complete(session, args, base)
+    prefix = " ".join(baseline["text"].split()[:12])
+    predicted = await complete(
+        session,
+        args,
+        {
+            **base,
+            "prediction": {"type": "content", "content": prefix},
+        },
+    )
+    assert predicted["usage"]["completion_tokens"] == 40
+    assert predicted["token_ids"] == baseline["token_ids"], (baseline, predicted)
+    limited = await complete(
+        session,
+        args,
+        {
+            **base,
+            "max_completion_tokens": 7,
+            "prediction": {"type": "content", "content": baseline["text"]},
+        },
+    )
+    assert limited["usage"]["completion_tokens"] == 7
+    assert limited["token_ids"] == baseline["token_ids"][:7]
+    stop = baseline["text"].split()[8]
+    stopped = await complete(
+        session,
+        args,
+        {
+            **base,
+            "stop": [stop],
+            "prediction": {"type": "content", "content": baseline["text"]},
+        },
+    )
+    assert stopped["finish_reason"] == "stop" and stop not in stopped["text"]
+    canceled = {
+        **base,
+        "max_completion_tokens": 512,
+        "stream": True,
+        "prediction": {"type": "content", "content": baseline["text"]},
+        "request_id": "prediction-lifecycle-reused",
+    }
+    async with session.post(
+        args.base_url + "/v1/chat/completions", json=canceled
+    ) as response:
+        response.raise_for_status()
+        async for raw in response.content:
+            if raw.startswith(b"data: ") and b'"content"' in raw:
+                break
+    await asyncio.sleep(2)
+    reused = await complete(
+        session,
+        args,
+        {
+            **base,
+            "request_id": canceled["request_id"],
+            "prediction": {
+                "type": "content",
+                "content": "A completely unrelated prediction.",
+            },
+        },
+    )
+    assert reused["token_ids"] == baseline["token_ids"], (baseline, reused)
+    return {
+        "baseline": baseline,
+        "exhausted": predicted,
+        "limited": limited,
+        "stopped": stopped,
+        "reused": reused,
+    }
+
+
 async def run(args):
     output = {
         "args": vars(args),
@@ -288,6 +379,11 @@ async def run(args):
     async with aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=300)
     ) as session:
+        if args.validate_lifecycle:
+            output["lifecycle"] = await validate_lifecycle(session, args)
+            Path(args.output).write_text(json.dumps(output, indent=2) + "\n")
+            print("Lifecycle checks passed", flush=True)
+            return
         if args.eval_questions:
             output["evaluation"] = await evaluate(session, args)
             Path(args.output).write_text(json.dumps(output, indent=2) + "\n")
@@ -358,6 +454,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", required=True)
     parser.add_argument("--requests", type=int, default=24)
     parser.add_argument("--eval-questions", type=int, default=0)
+    parser.add_argument("--validate-lifecycle", action="store_true")
     parser.add_argument("--max-tokens", type=int, default=1536)
     parser.add_argument("--concurrencies", type=int, nargs="+", default=[1, 8])
     parser.add_argument("--temperatures", type=float, nargs="+", default=[0, 0.7, 1])
