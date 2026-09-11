@@ -4,6 +4,8 @@
 
 import argparse
 import json
+import os
+import subprocess
 import time
 from functools import partial
 
@@ -19,10 +21,29 @@ from vllm.config import (
     set_current_vllm_config,
 )
 from vllm.forward_context import set_forward_context
-from vllm.v1.spec_decode.ngram_proposer_gpu import NgramProposerGPU
+from vllm.v1.spec_decode.ngram_proposer_gpu import (
+    NgramPredictionState,
+    NgramProposerGPU,
+)
 
 
 def benchmark(args):
+    print(
+        json.dumps(
+            {
+                "commit": subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], text=True
+                ).strip(),
+                "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+                "torch": torch.__version__,
+                "cuda_runtime": torch.version.cuda,
+                "dtype": "int32",
+                "draft_tokens": 8,
+                "ngram_size": 5,
+            }
+        ),
+        flush=True,
+    )
     for length in args.lengths:
         config = VllmConfig(
             model_config=ModelConfig(
@@ -43,13 +64,22 @@ def benchmark(args):
                 prompt_lookup_max=5,
             ),
         )
+        allocated = torch.accelerator.memory_allocated()
+        state = NgramPredictionState(max(args.batches), length, torch.device("cuda:0"))
+        prediction_allocated_bytes = torch.accelerator.memory_allocated() - allocated
+        del state
         start = time.perf_counter()
         with set_current_vllm_config(config):
             proposer = NgramProposerGPU(config, torch.device("cuda:0"))
         torch.accelerator.synchronize()
         print(
             json.dumps(
-                {"length": length, "compile_and_warmup_s": time.perf_counter() - start}
+                {
+                    "length": length,
+                    "max_batch": max(args.batches),
+                    "prediction_allocated_bytes": prediction_allocated_bytes,
+                    "compile_and_warmup_s": time.perf_counter() - start,
+                }
             )
         )
         for batch in args.batches:
